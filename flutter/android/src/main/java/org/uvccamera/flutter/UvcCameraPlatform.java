@@ -415,8 +415,27 @@ import io.flutter.view.TextureRegistry;
             supportedSizesWithAreaDelta.add(new Pair<>(size, areaDelta));
         }
         Collections.sort(supportedSizesWithAreaDelta, (l, r) -> Integer.compare(r.second, l.second));
-        final var desiredFrameSize = supportedSizesWithAreaDelta.get(0).first;
-        Log.d(TAG, "openCamera: best size found: " + desiredFrameSize);
+
+        // candidateSizes: list of [width, height] pairs to try, in preference order.
+        // When getSupportedSizeList() returns empty (non-standard UVC frame-descriptor
+        // format — common in cheap endoscope cameras), we fall back to well-known
+        // resolutions instead of crashing with IndexOutOfBoundsException.
+        // The leaked libusb interface from that crash caused every subsequent attempt
+        // to fail with err=-99 (EBUSY), requiring a physical replug each time.
+        final List<int[]> candidateSizes;
+        if (supportedSizesWithAreaDelta.isEmpty()) {
+            Log.w(TAG, "openCamera: getSupportedSizeList() returned empty list — trying hardcoded fallback resolutions");
+            candidateSizes = List.of(
+                    new int[]{640, 480},
+                    new int[]{1920, 1080},
+                    new int[]{1280, 720},
+                    new int[]{320, 240}
+            );
+        } else {
+            final var best = supportedSizesWithAreaDelta.get(0).first;
+            Log.d(TAG, "openCamera: best size found: " + best);
+            candidateSizes = List.of(new int[]{best.width, best.height});
+        }
 
         // Set the error callback
         Log.d(TAG, "openCamera: setting error callback");
@@ -445,20 +464,22 @@ import io.flutter.view.TextureRegistry;
             throw new IllegalStateException("Failed to set button callback", e);
         }
 
-        // Set the preview size and the frame format
+        // Set the preview size and the frame format — try each candidate size × format
+        // combination in order until one is accepted.
         Log.d(TAG, "openCamera: setting preview size and frame format");
+        int[] chosenSize = null;
         Integer frameFormat = null;
-        for (final var desiredFrameFormat : List.of(UVCCamera.FRAME_FORMAT_MJPEG, UVCCamera.FRAME_FORMAT_YUYV)) {
-            try {
-                camera.setPreviewSize(
-                        desiredFrameSize.width,
-                        desiredFrameSize.height,
-                        desiredFrameFormat
-                );
-                frameFormat = desiredFrameFormat;
-                break;
-            } catch (final IllegalArgumentException e) {
-                Log.w(TAG, "Unsupported frame format: " + desiredFrameFormat);
+        sizeLoop:
+        for (final var sz : candidateSizes) {
+            for (final var fmt : List.of(UVCCamera.FRAME_FORMAT_MJPEG, UVCCamera.FRAME_FORMAT_YUYV)) {
+                try {
+                    camera.setPreviewSize(sz[0], sz[1], fmt);
+                    chosenSize = sz;
+                    frameFormat = fmt;
+                    break sizeLoop;
+                } catch (final IllegalArgumentException e) {
+                    Log.w(TAG, "openCamera: " + sz[0] + "x" + sz[1] + " format " + fmt + " not supported");
+                }
             }
         }
         if (frameFormat == null) {
@@ -466,12 +487,12 @@ import io.flutter.view.TextureRegistry;
             camera.destroy();
             throw new IllegalStateException("No supported frame format found");
         }
-        Log.d(TAG, "openCamera: preview size and frame format set: frameFormat=" + frameFormat);
+        Log.d(TAG, "openCamera: preview size and frame format set: " + chosenSize[0] + "x" + chosenSize[1] + " frameFormat=" + frameFormat);
 
         // Set the preview display surface and start the preview
         Log.d(TAG, "openCamera: setting preview surface and starting preview");
         final var cameraSurfaceProducer = textureRegistry.createSurfaceProducer();
-        cameraSurfaceProducer.setSize(desiredFrameSize.width, desiredFrameSize.height);
+        cameraSurfaceProducer.setSize(chosenSize[0], chosenSize[1]);
         cameraSurfaceProducer.setCallback(errorCallback.textureRegistrySurfaceProducerCallback);
         final var cameraSurface = cameraSurfaceProducer.getSurface();
         try {
